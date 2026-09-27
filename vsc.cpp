@@ -887,12 +887,17 @@ static void texDone() {
 }
 
 // ───────────────────────── rendering ─────────────────────────
-static const char *BG = "30;30;30", *CURL = "40;40;40", *SELB = "38;79;120", *FINDB = "98;51;21",
-                  *GUT = "133;133;133", *GUTA = "198;198;198", *TABBAR = "37;37;38", *TABIN = "45;45;45",
-                  *TABFG = "150;150;150", *WHITE = "255;255;255", *STAT = "0;122;204", *FGN = "212;212;212",
-                  *SBBG = "37;37;38", *SBFG = "204;204;204", *SBHEAD = "187;187;187", *SELF = "4;57;94",
-                  *SELU = "55;55;61", *CHEV = "197;197;197", *CRUMB = "169;169;169", *KEYBG = "51;51;51",
-                  *GUIDE = "64;64;64";
+// All-black theme: every pane is black and the panes are told apart by thin boundary lines: a │ between
+// the sidebar and the editor (btop's cpu-box green), an underline under the tab row (grey) and one above
+// the status bar (btop's net-box purple). Text and token colours are VS Code Dark+'s.
+static const char *BG = "0;0;0", *CURL = "40;40;40", *SELB = "38;79;120", *FINDB = "98;51;21",
+                  *GUT = "133;133;133", *GUTA = "198;198;198", *TABBAR = "0;0;0", *TABIN = "0;0;0",
+                  *TABFG = "150;150;150", *WHITE = "255;255;255", *STAT = "0;0;0", *FGN = "212;212;212",
+                  *SBBG = "0;0;0", *SBFG = "204;204;204", *SBHEAD = "187;187;187", *SELF = "0;122;204",
+                  *SELT = "117;190;255", *CHEV = "197;197;197", *CRUMB = "169;169;169", *KEYBG = "51;51;51",
+                  *GUIDE = "64;64;64", *BORDER = "85;109;89";
+// a boundary drawn as a coloured underline of a whole row (foot supports SGR 58 underline colours)
+static const char *UL_ON = "\x1b[4m\x1b[58;2;90;90;90m", *UL_STAT = "\x1b[4m\x1b[58;2;92;88;141m", *UL_ACC = "\x1b[58;2;0;122;204m", *UL_OFF = "\x1b[24m";
 static const char *g_cf, *g_cb;
 static void col(string& o, const char* f, const char* b) {
   if (f != g_cf) { o += "\x1b[38;2;"; o += f; o += 'm'; g_cf = f; }
@@ -1055,6 +1060,7 @@ static void drawSidebar(string& o) {
   string left = " EXPLORER", right = sw >= 24 ? " +  ⊞  ↻  ⊟ " : "";
   int rw = dispW(right);
   at(o, 1, 1);
+  o += UL_ON;
   col(o, SBHEAD, SBBG);
   left = fitW(left, sw - rw);
   o += left;
@@ -1064,31 +1070,46 @@ static void drawSidebar(string& o) {
     o += right;
     for (int i = 0; i < 4; i++) g_btnX[i] = sw - rw + 1 + 3 * i;
   }
+  o += UL_OFF;
   // folder section header
   string sec = string(g_root.open ? " ▾ " : " ▸ ") + g_root.name;
   for (size_t i = 3; i < sec.size(); i++) sec[i] = (char)toupper((unsigned char)sec[i]);
   sec = fitW(sec, sw);
+  // The selected row is outlined in VS Code blue rather than filled, with its name in a lighter blue: its
+  // sides are ▏ ▕ and its top and bottom edges are underlines of the row above and of itself.
+  const char* sc = SELF;
+  string selUL = string("\x1b[4m\x1b[58;2;") + sc + "m";
   at(o, 2, 1);
+  if (si >= 0 && si == g_sbTop) o += selUL;  // top edge of a selection in the first row
   col(o, SBFG, SBBG);
   o += "\x1b[1m" + sec + "\x1b[22m";
   o.append(sw - dispW(sec), ' ');
   for (int r = 0; r < tv; r++) {
     int j = g_sbTop + r;
     at(o, r + 3, 1);
+    o += UL_OFF;
+    bool sel = j == si;
+    if (sel || (si >= 0 && j == si - 1)) o += selUL;
+    else if (r == tv - 1) o += UL_STAT;
     if (j >= n) { col(o, SBFG, SBBG); o.append(sw, ' '); continue; }
     const Row& R = g_rows[j];
-    const char* bg = j == si ? (g_focusSb ? SELF : SELU) : SBBG;
+    const char* bg = SBBG;
     int used = std::min(1 + 2 * R.depth, std::max(0, sw - 6));
-    col(o, SBFG, bg);
-    o.append(used, ' ');
-    if (R.n->dir) { col(o, CHEV, bg); o += R.n->open ? "▾ " : "▸ "; used += 2; }
+    if (sel && used) { col(o, sc, bg); o += "▏"; col(o, SBFG, bg); o.append(used - 1, ' '); }
+    else { col(o, SBFG, bg); o.append(used, ' '); }
+    if (R.n->dir) { col(o, sel ? SELT : CHEV, bg); o += R.n->open ? "▾ " : "▸ "; used += 2; }
     else { Icon ic = iconFor(R.n->name); col(o, ic.c, bg); o += ic.g; o += ' '; used += 3; }
-    string nm = fitW(R.n->name, std::max(0, sw - used - 1));
-    col(o, SBFG, bg);
+    string nm = fitW(R.n->name, std::max(0, sw - used - 1 - sel));  // (column sw is the pane border)
+    col(o, sel ? SELT : SBFG, bg);
     o += nm;
     used += dispW(nm);
-    o.append(std::max(0, sw - used), ' ');
+    o.append(std::max(0, sw - 1 - sel - used), ' ');
+    if (sel) { col(o, sc, bg); o += "▕"; }
+    o += ' ';
   }
+  o += UL_OFF;
+  col(o, BORDER, SBBG);  // the boundary with the editor, in the sidebar's last column
+  for (int r = 1; r < H; r++) { at(o, r, sw); o += "│"; }
 }
 
 static void drawWatermark(string& o, int th) {  // empty editor group, like VS Code
@@ -1097,6 +1118,7 @@ static void drawWatermark(string& o, int th) {  // empty editor group, like VS C
   int n = 6, top = std::max(0, (th - n * 2) / 2), w = 30, pad = std::max(0, (EW - w) / 2);
   for (int r = 0; r < th; r++) {
     at(o, r + 3, EX + 1);
+    o += r == th - 1 ? UL_STAT : UL_OFF;
     col(o, FGN, BG);
     int li = r - top;
     if (li < 0 || li % 2 || li / 2 >= n || EW < w) { o.append(EW, ' '); continue; }
@@ -1146,12 +1168,14 @@ static void draw() {
     g_tabOff++;
   }
   at(o, 1, EX + 1);
+  o += UL_ON;
   int x = 0;
   for (int i = g_tabOff; i < (int)B.size(); i++) {
     if (x + tw[i] > EW) break;
     bool a = i == cur;
     const char* bg = a ? BG : TABIN;
     Icon ic = iconFor(B[i].name);
+    if (a) o += UL_ACC;  // the active tab's underline is the accent colour
     col(o, a ? WHITE : TABFG, bg);
     o += "  ";
     col(o, ic.c, bg);
@@ -1159,11 +1183,13 @@ static void draw() {
     col(o, a ? WHITE : TABFG, bg);
     o += lab[i].substr(2 + strlen(ic.g));
     g_tabs[i] = {EX + x, EX + x + tw[i], EX + x + tw[i] - 2};
+    if (a) o += UL_ON;
     x += tw[i];
     if (x < EW) { col(o, TABFG, TABBAR); o += ' '; x++; }
   }
   col(o, TABFG, TABBAR);
   o.append(EW - x, ' ');
+  o += UL_OFF;
 
   // ── breadcrumbs (row 2) ──
   at(o, 2, EX + 1);
@@ -1221,6 +1247,7 @@ static void draw() {
     for (int r = 0; r < th; r++) {
       int y = b.top + r;
       at(o, r + 3, EX + 1);
+      if (r == th - 1) o += UL_STAT;  // the boundary with the status bar
       if (y >= n) { col(o, FGN, BG); o.append(EW, ' '); continue; }
       bool isCur = y == b.cy;
       const char* rowbg = isCur && !hs ? CURL : BG;
@@ -1307,6 +1334,7 @@ static void draw() {
   } else if (!g_msg.empty()) left += " " + g_msg;
   left = fitW(left, std::max(0, W - rw - 1));
   at(o, H, 1);
+  o += UL_OFF;
   col(o, WHITE, STAT);
   o += left;
   o.append(W - rw - dispW(left), ' ');

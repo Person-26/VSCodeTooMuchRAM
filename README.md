@@ -1,8 +1,8 @@
 # vsc — VS Code look & keys: ~0.4 MB real memory (PSS)
 
 A single-file C++17 terminal editor laid out like VS Code: an **Explorer sidebar** with the folder's file
-tree on the left, editor tabs + breadcrumbs on the right, and the blue status bar (with git branch) at the
-bottom, all in the Dark+ theme with VS Code keybindings. No ncurses, no GUI toolkit, no dependencies. PDFs open in Okular
+tree on the left, editor tabs + breadcrumbs on the right, and the status bar (with git branch) at the
+bottom, with VS Code keybindings. The theme is all black, with thin boundary lines between the panes in btop's default box colours (green sidebar edge, purple above the status bar, grey under the tabs) (the active tab is underlined in blue, and the selected explorer row is outlined in blue rather than filled, with its name in a lighter blue) and VS Code Dark+ text colours. No ncurses, no GUI toolkit, no dependencies. PDFs open in Okular
 rather than in the terminal.
 
 ```
