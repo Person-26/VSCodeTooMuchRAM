@@ -1,5 +1,6 @@
 // vsc — a tiny VS Code–style terminal text editor. Single file, no dependencies
-// beyond the C++ standard library and POSIX. PDFs are opened in Okular.
+// beyond the C++ standard library and POSIX. PDFs open in a tile, rendered by Okular's engine (the vsc-pdf
+// helper) and shown with kitty graphics, in terminals that have them (Ghostty, kitty); elsewhere in Okular.
 //
 // Build: make            Run: ./vsc [file ...]
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 #include <dirent.h>
@@ -17,6 +19,8 @@
 #include <signal.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -31,7 +35,7 @@ static string num(long v) { return std::to_string(v); }
 // ───────────────────────── terminal ─────────────────────────
 static termios g_orig;
 static bool g_raw = false;
-static int W = 80, H = 24;
+static int W = 80, H = 24, g_pxW = 0, g_pxH = 0;  // g_px*: the text area in pixels (0: not reported)
 static volatile sig_atomic_t g_resized = 0;
 // LaTeX build started on save of a .tex file (runs in the background)
 static pid_t g_texPid = -1;
@@ -39,6 +43,16 @@ static int g_texFd = -1;  // read end of a pipe the build holds open; EOF = buil
 static string g_texPdf, g_texLog;
 static long long g_texT0;
 static void texDone();
+static void pdfReload(const string& path);
+static bool msg(const string& m);
+static int g_pdfOut = -1;  // vsc-pdf's output: rendered pages arrive here
+static bool g_tick = false;  // the last blocking read timed out for a scroll animation frame
+static int pdfFrameMs();
+static void pdfRead();
+static void pdfShutdown();
+static void pdfReap(bool all);
+struct Pdf;
+static int pdfPage(const Pdf& p);
 
 static void wr(const string& s) {
   const char* p = s.data();
@@ -53,6 +67,7 @@ static void restore() {
   if (g_texPid > 0) kill(-g_texPid, SIGTERM);
   if (!g_raw) return;
   g_raw = false;
+  pdfShutdown();
   const char* s = "\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l"
                   "\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l\x1b[23;0t";
   if (write(1, s, strlen(s)) < 0) {}
@@ -62,7 +77,7 @@ static void onFatal(int s) { restore(); signal(s, SIG_DFL); raise(s); }
 static void onWinch(int) { g_resized = 1; }
 static void getSize() {
   winsize ws{};
-  if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col) { W = ws.ws_col; H = ws.ws_row; }
+  if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col) { W = ws.ws_col; H = ws.ws_row; g_pxW = ws.ws_xpixel; g_pxH = ws.ws_ypixel; }
   if (H < 3) H = 3;
   if (W < 10) W = 10;
 }
@@ -95,10 +110,18 @@ static unsigned char ib[4096];
 static int ibN = 0, ibP = 0;
 static int rd(int ms) {
   if (ibP < ibN) return ib[ibP++];
-  // only a blocking read watches the build: short reads are mid-escape-sequence or mid-paste
-  pollfd p[2] = {{0, POLLIN, 0}, {g_texFd, POLLIN, 0}};
-  if (poll(p, ms < 0 && g_texFd >= 0 ? 2 : 1, ms) <= 0) return -1;
-  if (!p[0].revents) { texDone(); return -1; }
+  // only a blocking read watches the build and the PDF renderer, and times out for animation frames: short
+  // reads are mid-escape-sequence or mid-paste
+  pollfd p[3] = {{0, POLLIN, 0}, {g_texFd, POLLIN, 0}, {g_pdfOut, POLLIN, 0}};
+  bool blk = ms < 0;
+  int r = poll(p, blk ? 3 : 1, blk ? pdfFrameMs() : ms);  // poll skips the fds that are -1
+  if (r == 0 && blk) g_tick = true;
+  if (r <= 0) return -1;
+  if (!p[0].revents) {
+    if (p[1].revents) texDone();
+    if (p[2].revents) pdfRead();
+    return -1;
+  }
   ssize_t n = read(0, ib, sizeof ib);
   if (n == 0) exit(0);  // terminal gone
   if (n < 0) return -1;
@@ -134,6 +157,7 @@ static void readPaste() {
   pasteBuf.swap(o);
 }
 
+static void pdfGfxError(const string& r);
 static int readKey() {
   int c = rd(-1);
   if (c < 0) return K_NONE;
@@ -147,11 +171,18 @@ static int readKey() {
     }
     return K_NONE;
   }
-  if (c1 == '_' || c1 == ']' || c1 == 'P') {  // terminal replies (APC/OSC/DCS): swallow
+  if (c1 == '_' || c1 == ']' || c1 == 'P') {  // terminal replies (APC/OSC/DCS): swallowed, but a kitty graphics
+    string r;                                  // error (for a PDF page) is shown
     for (int prev = 0;;) {
       int x = rd(100);
       if (x < 0 || x == 7 || (prev == 27 && x == '\\')) break;
+      if (r.size() < 200) r += (char)x;
       prev = x;
+    }
+    if (c1 == '_' && r[0] == 'G' && r.find(";OK") == string::npos && r.find("i=31;") == string::npos) {
+      if (!r.empty() && r.back() == 27) r.pop_back();
+      msg("Terminal graphics error: " + r.substr(1));
+      pdfGfxError(r);
     }
     return K_NONE;
   }
@@ -172,6 +203,11 @@ static int readKey() {
   }
   int n1 = 0, n2 = 1;
   sscanf(p.c_str(), "%d;%d", &n1, &n2);
+  if ((f == '~' && n1 == 27) || f == 'u') {  // a modified key as CSI 27;mod;key~ or CSI key;mod u: only Enter is used,
+    int key = n1, md = n2;                    // and Shift+Enter and Ctrl+Enter both come back as 13 | M_SHIFT
+    if (f == '~') sscanf(p.c_str(), "27;%d;%d", &md, &key);
+    return key == 13 ? 13 | ((md - 1) & 5 ? M_SHIFT : 0) : K_NONE;
+  }
   int m = n2 - 1, mod = 0;
   if (m & 1) mod |= M_SHIFT;
   if (m & 2) mod |= M_ALT;
@@ -472,12 +508,30 @@ struct Ring {
   void pop_front() { a[h] = Op(); h = (h + 1) % a.size(); n--; }
   void clear() { vector<Op>().swap(a); h = n = 0; }
 };
+// A PDF tile's view. Pages are laid out like Okular's continuous fit-width mode: each page is the view's width
+// minus 6 px (times zoom) and sits in a row 12 px taller than itself. y/x: the scroll position in pixels.
+struct Pdf {
+  vector<float> pw, ph;  // page sizes in points, from vsc-pdf (empty until the document is open)
+  string err;
+  double fy = 0, fx = 0, ty = 0, tx = 0;  // scroll animation: from, to
+  long long t0 = 0;
+  int dur = 0;
+  bool anim = false;
+  double zoom = 1;       // relative to fit width
+  int w = 0, total = 0;  // page width in pixels the layout (and the terminal's images) are for, and document height
+  int maxX = 0, maxY = 0, vh = 0;
+  vector<int> tops, hs;  // each page's top and height in pixels at width w
+  vector<char> st;       // per page: 0 = nothing, 1 = asked vsc-pdf for it, 2 = in the terminal
+  vector<char> placed;   // per page: shown on screen now
+  int wantLo = 0, wantHi = -1;  // the pages last asked of vsc-pdf
+};
 struct Buf {
   int id = 0;
+  std::unique_ptr<Pdf> pdf;  // set: this tile shows a PDF (L stays empty)
   string path, name, langName = "Plain Text";
   vector<string> L{""};
   bool crlf = false, ro = false;
-  int cy = 0, cx = 0, want = -1, top = 0, left = 0;
+  int cy = 0, cx = 0, want = -1, top = 0, topRow = 0;  // top: first line shown, topRow: its first wrapped row shown
   bool follow = true, sel = false;
   int ay = 0, ax = 0;
   Ring U;
@@ -490,8 +544,8 @@ struct Buf {
   unsigned head() const { return U.empty() ? base : U.back().g; }  // the step the text is at
   bool dirty() const { return head() != saved; }
 };
-static vector<Buf> B;
-static int cur = 0, g_ids = 0, g_untitled = 0;
+static vector<Buf> B;  // the open files, one per tile
+static int cur = 0, g_ids = 0, g_untitled = 0;  // cur: the focused tile
 static unsigned g_grp = 1, g_lastType = 0, g_prevType = 0;
 static string g_msg, g_clip, g_findQ, g_lastFind;
 static bool g_clipLine = false, g_run = true;
@@ -776,12 +830,14 @@ static void setLang(Buf& b) {
     if (e == m.e) { b.lang = m.l; b.langName = m.n; }
   b.st.assign(1, 0); b.stOK = 1;
 }
-static void newTab() {
+static bool discardOk();
+static void newFile() {
+  if (!discardOk()) return;
   Buf nb;
   nb.id = ++g_ids;
   nb.name = "Untitled-" + num(++g_untitled);
-  B.push_back(std::move(nb));
-  cur = (int)B.size() - 1;
+  if (B.empty()) B.push_back(std::move(nb));
+  else B[cur] = std::move(nb);
 }
 
 // ───────────────────────── LaTeX build on save ─────────────────────────
@@ -883,21 +939,20 @@ static void texDone() {
   long long ms = nowMs() - g_texT0;
   if (code == 127) msg("LaTeX build: neither latexmk nor pdflatex found");
   else if (code) msg("LaTeX build failed: " + texError());
-  else msg("Built " + baseName(g_texPdf) + " (" + num(ms / 1000) + "." + num(ms / 100 % 10) + "s)");
+  else { msg("Built " + baseName(g_texPdf) + " (" + num(ms / 1000) + "." + num(ms / 100 % 10) + "s)"); pdfReload(g_texPdf); }
 }
 
 // ───────────────────────── rendering ─────────────────────────
 // All-black theme: every pane is black and the panes are told apart by thin boundary lines: a │ between
-// the sidebar and the editor (btop's cpu-box green), an underline under the tab row (grey) and one above
+// the sidebar and the editor (btop's cpu-box green), an underline under the explorer header (grey) and one above
 // the status bar (btop's net-box purple). Text and token colours are VS Code Dark+'s.
 static const char *BG = "0;0;0", *CURL = "40;40;40", *SELB = "38;79;120", *FINDB = "98;51;21",
-                  *GUT = "133;133;133", *GUTA = "198;198;198", *TABBAR = "0;0;0", *TABIN = "0;0;0",
-                  *TABFG = "150;150;150", *WHITE = "255;255;255", *STAT = "0;0;0", *FGN = "212;212;212",
+                  *GUT = "133;133;133", *GUTA = "198;198;198", *WHITE = "255;255;255", *STAT = "0;0;0", *FGN = "212;212;212",
                   *SBBG = "0;0;0", *SBFG = "204;204;204", *SBHEAD = "187;187;187", *SELF = "0;122;204",
-                  *SELT = "117;190;255", *CHEV = "197;197;197", *CRUMB = "169;169;169", *KEYBG = "51;51;51",
-                  *GUIDE = "64;64;64", *BORDER = "85;109;89";
+                  *SELT = "117;190;255", *CHEV = "197;197;197", *KEYBG = "51;51;51",
+                  *GUIDE = "64;64;64", *BORDER = "85;109;89", *TILE = "90;90;90";
 // a boundary drawn as a coloured underline of a whole row (foot supports SGR 58 underline colours)
-static const char *UL_ON = "\x1b[4m\x1b[58;2;90;90;90m", *UL_STAT = "\x1b[4m\x1b[58;2;92;88;141m", *UL_ACC = "\x1b[58;2;0;122;204m", *UL_OFF = "\x1b[24m";
+static const char *UL_ON = "\x1b[4m\x1b[58;2;90;90;90m", *UL_STAT = "\x1b[4m\x1b[58;2;92;88;141m", *UL_OFF = "\x1b[24m";
 static const char *g_cf, *g_cb;
 static void col(string& o, const char* f, const char* b) {
   if (f != g_cf) { o += "\x1b[38;2;"; o += f; o += 'm'; g_cf = f; }
@@ -905,10 +960,9 @@ static void col(string& o, const char* f, const char* b) {
 }
 static void at(string& o, int row, int c) { o += "\x1b["; o += num(row); o += ';'; o += num(c); o += 'H'; }
 
-struct TabHit { int x0, x1, cx; };
-static vector<TabHit> g_tabs;
-static int g_tabOff = 0, g_lnX0 = -1, g_lnX1 = -1;
+static int g_lnX0 = -1, g_lnX1 = -1;
 static const char* g_pLabel = nullptr;
+static bool g_enterShift = false;  // the last prompt was accepted with Shift+Enter
 static string* g_pText = nullptr;
 // layout: sidebar is columns [0, g_sbW); the editor starts at column EX and is EW wide
 static int g_sbW = 0, g_sbWant = 30, EX = 0, EW = 80;
@@ -917,6 +971,19 @@ static bool g_sbShow = true, g_focusSb = false;
 static void layout() {
   g_sbW = (g_sbShow && W >= 40) ? std::max(15, std::min(g_sbWant, W / 2)) : 0;
   EX = g_sbW; EW = W - EX;
+}
+// Tiles fill the editor area (rows 0 .. H-2) in a grid of ceil(sqrt(n)) columns; a short last row's tiles share
+// its width. With two or more, each tile has a box border: blue round the focused one, grey round the rest.
+static void tileRect(int i, int& x, int& y, int& w, int& h) {
+  int n = std::max(1, len(B)), cols = 1;
+  while (cols * cols < n) cols++;
+  int rows = (n + cols - 1) / cols, r = i / cols, c = i % cols, cnt = r == rows - 1 ? n - r * cols : cols, th = H - 1;
+  x = EX + EW * c / cnt; w = EX + EW * (c + 1) / cnt - x;
+  y = th * r / rows; h = th * (r + 1) / rows - y;
+}
+static void textRect(int i, int& x, int& y, int& w, int& h) {  // the part inside the border
+  tileRect(i, x, y, w, h);
+  if (len(B) > 1) { x++; y++; w = std::max(0, w - 2); h = std::max(0, h - 2); }
 }
 static int gutterW(const Buf& b) {
   int d = 1;
@@ -1043,11 +1110,6 @@ static Icon iconFor(const string& name) {  // Seti-style file icons
     if (e == t.e) return {t.g, t.c};
   return {"· ", "109;128;134"};
 }
-static string relPath(const string& p) {
-  string pre = rootPrefix();
-  if (!g_rootPath.empty() && !p.compare(0, pre.size(), pre)) return p.substr(pre.size());
-  return p;
-}
 
 static void drawSidebar(string& o) {
   int sw = g_sbW, tv = H - 3;
@@ -1075,12 +1137,23 @@ static void drawSidebar(string& o) {
   string sec = string(g_root.open ? " ▾ " : " ▸ ") + g_root.name;
   for (size_t i = 3; i < sec.size(); i++) sec[i] = (char)toupper((unsigned char)sec[i]);
   sec = fitW(sec, sw);
-  // The selected row is outlined in VS Code blue rather than filled, with its name in a lighter blue: its
-  // sides are ▏ ▕ and its top and bottom edges are underlines of the row above and of itself.
-  const char* sc = SELF;
-  string selUL = string("\x1b[4m\x1b[58;2;") + sc + "m";
+  // The selected row is outlined in VS Code blue rather than filled, with its name in a lighter blue, and the
+  // other files open in tiles are outlined in grey, like their tiles' borders. An outline's sides are ▏ ▕ and
+  // its top and bottom edges are underlines of the row above and of itself (blue wins a shared edge).
+  auto outline = [&](int j) -> const char* {
+    if (j == si) return SELF;
+    if (j < 0 || j >= n || g_rows[j].n->dir) return nullptr;
+    for (auto& b : B)
+      if (b.path == g_rows[j].path) return TILE;
+    return nullptr;
+  };
+  auto ul = [](const char* c) { return c ? string("\x1b[4m\x1b[58;2;") + c + "m" : string(); };
+  auto edge = [&](int j) {  // the underline of row j: the bottom edge of j's outline or the top edge of j+1's
+    const char *a = outline(j), *b = outline(j + 1);
+    return ul(a == SELF || b == SELF ? SELF : a ? a : b);
+  };
   at(o, 2, 1);
-  if (si >= 0 && si == g_sbTop) o += selUL;  // top edge of a selection in the first row
+  o += ul(outline(g_sbTop));  // top edge of an outline in the first row
   col(o, SBFG, SBBG);
   o += "\x1b[1m" + sec + "\x1b[22m";
   o.append(sw - dispW(sec), ' ');
@@ -1088,8 +1161,10 @@ static void drawSidebar(string& o) {
     int j = g_sbTop + r;
     at(o, r + 3, 1);
     o += UL_OFF;
-    bool sel = j == si;
-    if (sel || (si >= 0 && j == si - 1)) o += selUL;
+    const char* sc = outline(j);
+    bool sel = sc;
+    string e = edge(j);
+    if (!e.empty()) o += e;
     else if (r == tv - 1) o += UL_STAT;
     if (j >= n) { col(o, SBFG, SBBG); o.append(sw, ' '); continue; }
     const Row& R = g_rows[j];
@@ -1097,10 +1172,10 @@ static void drawSidebar(string& o) {
     int used = std::min(1 + 2 * R.depth, std::max(0, sw - 6));
     if (sel && used) { col(o, sc, bg); o += "▏"; col(o, SBFG, bg); o.append(used - 1, ' '); }
     else { col(o, SBFG, bg); o.append(used, ' '); }
-    if (R.n->dir) { col(o, sel ? SELT : CHEV, bg); o += R.n->open ? "▾ " : "▸ "; used += 2; }
+    if (R.n->dir) { col(o, j == si ? SELT : CHEV, bg); o += R.n->open ? "▾ " : "▸ "; used += 2; }
     else { Icon ic = iconFor(R.n->name); col(o, ic.c, bg); o += ic.g; o += ' '; used += 3; }
     string nm = fitW(R.n->name, std::max(0, sw - used - 1 - sel));  // (column sw is the pane border)
-    col(o, sel ? SELT : SBFG, bg);
+    col(o, j == si ? SELT : SBFG, bg);
     o += nm;
     used += dispW(nm);
     o.append(std::max(0, sw - 1 - sel - used), ' ');
@@ -1117,7 +1192,7 @@ static void drawWatermark(string& o, int th) {  // empty editor group, like VS C
                                {"Toggle Sidebar", "Ctrl+B"},  {"Find in File", "Ctrl+F"}, {"Quit", "Ctrl+Q"}};
   int n = 6, top = std::max(0, (th - n * 2) / 2), w = 30, pad = std::max(0, (EW - w) / 2);
   for (int r = 0; r < th; r++) {
-    at(o, r + 3, EX + 1);
+    at(o, r + 1, EX + 1);
     o += r == th - 1 ? UL_STAT : UL_OFF;
     col(o, FGN, BG);
     int li = r - top;
@@ -1134,11 +1209,191 @@ static void drawWatermark(string& o, int th) {  // empty editor group, like VS C
   }
 }
 
+static void drawBorder(string& o, int i) {
+  int x, y, w, h;
+  tileRect(i, x, y, w, h);
+  if (w < 4 || h < 3) return;
+  const char* c = i == cur ? SELF : TILE;
+  string t = fitW(" " + B[i].name + (B[i].dirty() ? " ● " : " "), w - 4);
+  at(o, y + 1, x + 1);
+  o += UL_OFF;
+  col(o, c, BG); o += "┌─";
+  col(o, i == cur ? WHITE : GUT, BG); o += t;
+  col(o, c, BG);
+  for (int k = 3 + dispW(t); k < w; k++) o += "─";
+  col(o, i == cur ? WHITE : GUT, BG);
+  o += "×";  // the close button, in place of the top-right corner
+  for (int r = 1; r < h - 1; r++) { at(o, y + r + 1, x + 1); o += "│"; at(o, y + r + 1, x + w); o += "│"; }
+  at(o, y + h, x + 1);
+  if (y + h - 1 == H - 2) o += UL_STAT;  // the boundary with the status bar
+  o += "└";
+  for (int k = 2; k < w; k++) o += "─";
+  o += "┘";
+  o += UL_OFF;
+}
+// ── soft wrap: every line is cut into rows of at most ww columns, after the last space that fits (mid-word only
+// when a row has no space). Scrolling and Up/Down move by these rows; (y, k) is row k of line y. ──
+static void wrapRows(const string& s, int ww, vector<int>& st) {  // st: the byte each row starts at
+  st.assign(1, 0);
+  int rc = 0, c = 0, brk = -1, cb = 0;  // rc: column in the line, c: in the row; brk: byte after the row's last space, cb: c there
+  for (int q = 0; q < len(s); q = nx(s, q)) {
+    int w = chw(s, q, rc);
+    while (c + w > ww && c > 0) {
+      if (brk > st.back()) { st.push_back(brk); c -= cb; }
+      else { st.push_back(q); c = 0; }
+      brk = -1;
+    }
+    c += w; rc += w;
+    if (s[q] == ' ' || s[q] == '\t') { brk = nx(s, q); cb = c; }
+  }
+}
+static int wrapW(int i) {  // the width tile i's text wraps at
+  int x, y, w, h;
+  textRect(i, x, y, w, h);
+  return std::max(1, w - gutterW(B[i]));
+}
+static int rowOf(const vector<int>& st, int x) { return int(std::upper_bound(st.begin(), st.end(), x) - st.begin()) - 1; }
+static int nRows(const Buf& b, int y, int ww) { static vector<int> st; wrapRows(b.L[y], ww, st); return len(st); }
+static void stepRows(const Buf& b, int ww, int& y, int& k, int d) {  // moves (y, k) d rows, stopping at the file's ends
+  int n = len(b.L);
+  while (d > 0) {
+    int r = nRows(b, y, ww);
+    if (k + d < r) { k += d; return; }
+    if (y == n - 1) { k = r - 1; return; }
+    d -= r - k; y++; k = 0;
+  }
+  while (d < 0) {
+    if (k + d >= 0) { k += d; return; }
+    if (y == 0) { k = 0; return; }
+    d += k + 1; y--; k = nRows(b, y, ww) - 1;
+  }
+}
+static int rowX(const string& s, const vector<int>& st, int k, int c) {  // the byte at column c of row k, kept in the row
+  int a1 = k + 1 < len(st) ? st[k + 1] : len(s), q = st[k], rc = rcol(s, q), used = 0;
+  while (q < a1) {
+    int w = chw(s, q, rc);
+    if (used + w > c) break;
+    used += w; rc += w; q = nx(s, q);
+  }
+  return q == a1 && k + 1 < len(st) ? pv(s, a1) : q;
+}
+
+static void pdfTile(string& o, int i);
+static void drawTile(string& o, int i, int& crow, int& ccol) {
+  Buf& b = B[i];
+  int X, Y, EW, th, gw = gutterW(b);
+  if (len(B) > 1) drawBorder(o, i);
+  if (b.pdf) { pdfTile(o, i); return; }
+  textRect(i, X, Y, EW, th);
+  if (EW <= gw || th <= 0) {  // too small for any text
+    col(o, FGN, BG);
+    for (int r = 0; r < th; r++) { at(o, Y + r + 1, X + 1); o.append(std::max(0, EW), ' '); }
+    return;
+  }
+  int n = len(b.L), txw = EW - gw;
+  static vector<int> st;
+  b.top = std::max(0, std::min(b.top, n - 1));
+  b.topRow = std::max(0, std::min(b.topRow, nRows(b, b.top, txw) - 1));
+  wrapRows(b.L[std::min(b.cy, n - 1)], txw, st);
+  int ck = rowOf(st, b.cx);  // the cursor's row in its line
+  if (b.follow) {
+    if (b.cy < b.top || (b.cy == b.top && ck < b.topRow)) { b.top = b.cy; b.topRow = ck; }
+    else {  // walk back from the cursor: if the top isn't within a screenful, the cursor's row becomes the bottom one
+      int y = b.cy, k = ck;
+      for (int r = 1; r < th && !(y == b.top && k == b.topRow); r++) stepRows(b, txw, y, k, -1);
+      b.top = y; b.topRow = k;
+    }
+  }
+  int sy0 = 0, sx0 = 0, sy1 = 0, sx1 = 0;
+  bool hs = selRange(b, sy0, sx0, sy1, sx1);
+  static vector<unsigned char> cls;
+  static vector<char> fm;
+  const Lang& lg = LANGS[b.lang];
+  // indent guides (│ at each whole 4-column level of leading whitespace); a blank line takes the deeper of the nearest
+  // non-blank lines above and below, so guides run through gaps inside a block
+  auto indentOf = [&](int y) { const string& l = b.L[y]; int f = firstNonWs(l); return f < len(l) ? rcol(l, f) : -1; };
+  auto guideTo = [&](int y) {
+    int g = indentOf(y);
+    if (g >= 0) return g;
+    int up = 0, dn = 0;
+    for (int k = y - 1; k >= 0 && k >= y - 100; k--) if ((up = indentOf(k)) >= 0) break;
+    for (int k = y + 1; k < n && k <= y + 100; k++) if ((dn = indentOf(k)) >= 0) break;
+    return std::max({up, dn, 0});
+  };
+  int r = 0;
+  for (int y = b.top, k = b.topRow; r < th; y++, k = 0) {
+    if (y >= n) {
+      for (; r < th; r++) {
+        at(o, Y + r + 1, X + 1);
+        o += Y + r == H - 2 ? UL_STAT : UL_OFF;  // the boundary with the status bar
+        col(o, FGN, BG); o.append(EW, ' ');
+      }
+      break;
+    }
+    const string& s = b.L[y];
+    wrapRows(s, txw, st);
+    int nr = len(st), kl = std::min(nr - 1, k + th - r - 1);  // kl: the last row of this line that fits
+    int lim = std::min(len(s), (kl + 1 < nr ? st[kl + 1] : len(s)) + 4);  // bytes that can reach the screen
+    cls.assign(lim + 1, C_N);
+    if (b.lang) hl(lg, s, stAt(b, y), cls.data(), lim);
+    fm.assign(lim + 1, 0);
+    if (!g_findQ.empty())
+      for (int p = ifind(s, g_findQ, 0); p >= 0 && p < lim; p = ifind(s, g_findQ, p + len(g_findQ)))
+        memset(fm.data() + p, 1, std::min(len(g_findQ), lim - p));
+    bool isCur = y == b.cy;
+    const char* rowbg = isCur && !hs ? CURL : BG;
+    int a = -1, e = -1, gi = guideTo(y), lead = firstNonWs(s);
+    auto pad = [&](int c0, int c1) {  // columns [c0, c1) of whitespace, with guides
+      for (int cc = c0; cc < c1; cc++)
+        if (cc + 4 <= gi && cc % 4 == 0) { col(o, GUIDE, g_cb); o += "│"; }
+        else o += ' ';
+    };
+    bool eol = false;
+    if (hs && y >= sy0 && y <= sy1) { a = y == sy0 ? sx0 : 0; e = y == sy1 ? sx1 : len(s); eol = y < sy1; }
+    int rc = rcol(s, st[k]);
+    for (; k < nr && r < th; k++, r++) {
+      at(o, Y + r + 1, X + 1);
+      o += Y + r == H - 2 ? UL_STAT : UL_OFF;  // the boundary with the status bar
+      col(o, isCur ? GUTA : GUT, BG);
+      if (k == 0) {  // the line number, on a line's first row only
+        string ln = num(y + 1);
+        o.append(std::max(0, gw - 2 - len(ln)), ' ');
+        o += ln;
+        o += "  ";
+      } else o.append(gw, ' ');
+      int a1 = k + 1 < nr ? st[k + 1] : len(s), rc0 = rc, used = 0;
+      for (int q = st[k]; q < a1 && q < lim; q = nx(s, q)) {
+        int w = chw(s, q, rc), vis = std::min(w, txw - used);
+        const char* bg = (q >= a && q < e) ? SELB : fm[q] ? FINDB : rowbg;
+        col(o, FG[cls[q]], bg);
+        unsigned char c = s[q];
+        if (q < lead) pad(rc, rc + vis);
+        else if (c == '\t' || vis < w) o.append(vis, ' ');
+        else if (c < 32 || c == 127) o += '?';
+        else o.append(s, q, nx(s, q) - q);
+        used += vis;
+        rc += w;
+      }
+      if (eol && k == nr - 1 && used < txw) { col(o, FGN, SELB); o += ' '; used++; }
+      col(o, FGN, rowbg);
+      if (k == 0) pad(used, txw);
+      else o.append(txw - used, ' ');
+      if (isCur && k == ck && i == cur) {
+        crow = Y + r + 1;
+        ccol = X + gw + std::min(rcol(s, b.cx) - rc0, txw - 1) + 1;
+      }
+    }
+  }
+  o += UL_OFF;
+  if (cls.capacity() > 65536) { vector<unsigned char>().swap(cls); vector<char>().swap(fm); }  // after a huge line
+  if (st.capacity() > 4096) vector<int>().swap(st);
+}
+
 static void draw() {
   if (g_resized) { g_resized = 0; getSize(); }
   layout();
   bool has = !B.empty();
-  int th = H - 3;
+  int th = H - 1;
   if (has && B[cur].path != g_lastActive) {  // explorer follows the active editor
     g_lastActive = B[cur].path;
     if (reveal(g_lastActive)) { g_sbSelPath = g_lastActive; buildRows(); sbShow(selIndex()); }
@@ -1146,158 +1401,16 @@ static void draw() {
   string o;
   o.reserve((size_t)W * H * 8);
   g_cf = g_cb = nullptr;
-  o += "\x1b[?25l\x1b[0m";
+  pdfReap(false);
+  o += "\x1b[?2026h\x1b[?25l\x1b[0m";  // one synchronized update
   string title = (has ? (B[cur].dirty() ? "● " : "") + B[cur].name + " - " : string()) + g_root.name + " - vsc";
   if (title != g_title) { g_title = title; o += "\x1b]2;" + title + "\x07"; }
   drawSidebar(o);
 
-  // ── tab bar (row 1, right of the sidebar) ──
-  g_tabs.assign(B.size(), TabHit{-1, -1, -1});
-  vector<string> lab(B.size());
-  vector<int> tw(B.size());
-  for (size_t i = 0; i < B.size(); i++) {
-    Icon ic = iconFor(B[i].name);
-    lab[i] = string("  ") + ic.g + " " + fitW(B[i].name, 30) + (B[i].dirty() ? "  ● " : "  × ");
-    tw[i] = dispW(lab[i]);
-  }
-  if (cur < g_tabOff) g_tabOff = cur;
-  for (;;) {
-    int sum = 0;
-    for (int j = g_tabOff; j <= cur && has; j++) sum += tw[j] + 1;
-    if (sum <= EW || g_tabOff >= cur) break;
-    g_tabOff++;
-  }
-  at(o, 1, EX + 1);
-  o += UL_ON;
-  int x = 0;
-  for (int i = g_tabOff; i < (int)B.size(); i++) {
-    if (x + tw[i] > EW) break;
-    bool a = i == cur;
-    const char* bg = a ? BG : TABIN;
-    Icon ic = iconFor(B[i].name);
-    if (a) o += UL_ACC;  // the active tab's underline is the accent colour
-    col(o, a ? WHITE : TABFG, bg);
-    o += "  ";
-    col(o, ic.c, bg);
-    o += ic.g;
-    col(o, a ? WHITE : TABFG, bg);
-    o += lab[i].substr(2 + strlen(ic.g));
-    g_tabs[i] = {EX + x, EX + x + tw[i], EX + x + tw[i] - 2};
-    if (a) o += UL_ON;
-    x += tw[i];
-    if (x < EW) { col(o, TABFG, TABBAR); o += ' '; x++; }
-  }
-  col(o, TABFG, TABBAR);
-  o.append(EW - x, ' ');
-  o += UL_OFF;
-
-  // ── breadcrumbs (row 2) ──
-  at(o, 2, EX + 1);
-  {
-    string bc;
-    if (has) {
-      string rp = B[cur].path.empty() ? B[cur].name : relPath(B[cur].path);
-      for (size_t a = 0, b; (b = rp.find('/', a)) != string::npos; a = b + 1) bc += rp.substr(a, b - a) + " › ";
-      bc = fitW(bc, std::max(0, EW - 2));
-    }
-    col(o, CRUMB, BG);
-    o += "  " + bc;
-    int used = 2 + dispW(bc);
-    if (has && used + 4 < EW) {
-      Icon ic = iconFor(B[cur].name);
-      string nm = fitW(B[cur].name, EW - used - 3);
-      col(o, ic.c, BG); o += ic.g;
-      col(o, SBFG, BG); o += " " + nm;
-      used += 3 + dispW(nm);
-    }
-    o.append(std::max(0, EW - used), ' ');
-  }
-
-  // ── editor body (rows 3 .. H-1) ──
+  // ── editor body (rows 1 .. H-1): the tiles ──
   int crow = -1, ccol = 0;
   if (!has) drawWatermark(o, th);
-  else {
-    Buf& b = B[cur];
-    int n = len(b.L), gw = gutterW(b), txw = EW - gw;
-    const string& cl = b.L[std::min(b.cy, n - 1)];
-    if (b.follow) {
-      if (b.cy < b.top) b.top = b.cy;
-      if (b.cy >= b.top + th) b.top = b.cy - th + 1;
-      int rc = rcol(cl, b.cx);
-      if (rc < b.left) b.left = rc;
-      if (rc >= b.left + txw) b.left = rc - txw + 1;
-    }
-    b.top = std::max(0, std::min(b.top, n - 1));
-    int sy0 = 0, sx0 = 0, sy1 = 0, sx1 = 0;
-    bool hs = selRange(b, sy0, sx0, sy1, sx1);
-    static vector<unsigned char> cls;
-    static vector<char> fm;
-    const Lang& lg = LANGS[b.lang];
-    // indent guides (│ at each whole 4-column level of leading whitespace); a blank line takes the deeper of the nearest
-    // non-blank lines above and below, so guides run through gaps inside a block
-    auto indentOf = [&](int y) { const string& l = b.L[y]; int f = firstNonWs(l); return f < len(l) ? rcol(l, f) : -1; };
-    auto guideTo = [&](int y) {
-      int g = indentOf(y);
-      if (g >= 0) return g;
-      int up = 0, dn = 0;
-      for (int k = y - 1; k >= 0 && k >= y - 100; k--) if ((up = indentOf(k)) >= 0) break;
-      for (int k = y + 1; k < n && k <= y + 100; k++) if ((dn = indentOf(k)) >= 0) break;
-      return std::max({up, dn, 0});
-    };
-    for (int r = 0; r < th; r++) {
-      int y = b.top + r;
-      at(o, r + 3, EX + 1);
-      if (r == th - 1) o += UL_STAT;  // the boundary with the status bar
-      if (y >= n) { col(o, FGN, BG); o.append(EW, ' '); continue; }
-      bool isCur = y == b.cy;
-      const char* rowbg = isCur && !hs ? CURL : BG;
-      string ln = num(y + 1);
-      col(o, isCur ? GUTA : GUT, BG);
-      o.append(std::max(0, gw - 2 - len(ln)), ' ');
-      o += ln;
-      o += "  ";
-      const string& s = b.L[y];
-      int lim = std::min(len(s), xfromr(s, b.left + txw) + 4);  // bytes that can reach the screen
-      cls.assign(lim + 1, C_N);
-      if (b.lang) hl(lg, s, stAt(b, y), cls.data(), lim);
-      fm.assign(lim + 1, 0);
-      if (!g_findQ.empty())
-        for (int p = ifind(s, g_findQ, 0); p >= 0 && p < lim; p = ifind(s, g_findQ, p + len(g_findQ)))
-          memset(fm.data() + p, 1, std::min(len(g_findQ), lim - p));
-      int a = -1, e = -1, gi = guideTo(y), lead = firstNonWs(s);
-      auto pad = [&](int c0, int c1) {  // screen-visible columns [c0, c1) of whitespace, with guides
-        for (int cc = c0; cc < c1; cc++)
-          if (cc + 4 <= gi && cc % 4 == 0) { col(o, GUIDE, g_cb); o += "│"; }
-          else o += ' ';
-      };
-      bool eol = false;
-      if (hs && y >= sy0 && y <= sy1) { a = y == sy0 ? sx0 : 0; e = y == sy1 ? sx1 : len(s); eol = y < sy1; }
-      int rc = 0, used = 0;
-      for (int i = 0; i < len(s) && used < txw; i = nx(s, i)) {
-        int w = chw(s, i, rc);
-        if (rc + w <= b.left) { rc += w; continue; }
-        if (i >= lim) break;
-        const char* bg = (i >= a && i < e) ? SELB : fm[i] ? FINDB : rowbg;
-        col(o, FG[cls[i]], bg);
-        unsigned char c = s[i];
-        int vis = std::min(rc + w, b.left + txw) - std::max(rc, b.left);
-        if (i < lead && rc >= b.left) pad(rc, rc + vis);
-        else if (c == '\t' || rc < b.left || rc + w > b.left + txw) o.append(vis, ' ');
-        else if (c < 32 || c == 127) o += '?';
-        else o.append(s, i, nx(s, i) - i);
-        used += vis;
-        rc += w;
-      }
-      if (eol && used < txw && rc >= b.left) { col(o, FGN, SELB); o += ' '; used++; }
-      col(o, FGN, rowbg);
-      pad(b.left + used, b.left + txw);
-      if (isCur) {
-        int cr = rcol(s, b.cx) - b.left;
-        if (cr >= 0 && cr < txw) { crow = r + 3; ccol = EX + gw + cr + 1; }
-      }
-    }
-    if (cls.capacity() > 65536) { vector<unsigned char>().swap(cls); vector<char>().swap(fm); }  // after a huge line
-  }
+  else for (int i = 0; i < len(B); i++) drawTile(o, i, crow, ccol);
 
   // ── status bar ──
   string left = g_branch.empty() ? "" : " ⎇ " + g_branch + " ", right;
@@ -1315,15 +1428,20 @@ static void draw() {
     string lc = "Ln " + num(b.cy + 1) + ", Col " + num(rcol(b.L[b.cy], b.cx) + 1);
     if (sel) lc += " (" + num(sel) + " selected)";
     right = lc + "    Spaces: 4    UTF-8    " + (b.crlf ? "CRLF" : "LF") + "    " + b.langName + " ";
+    if (b.pdf) {
+      Pdf& p = *b.pdf;
+      lc = "Page " + num(pdfPage(p) + 1) + " of " + num(len(p.pw));
+      right = lc + "    " + num(long(p.zoom * 100 + 0.5)) + "%    PDF ";
+    }
     int rw = std::min(dispW(right), W);
     right = fitW(right, rw);
     int rx = W - rw;
-    size_t k = right.find("Ln ");
+    size_t k = right.find(b.pdf ? "Page " : "Ln ");
     if (k != string::npos) {
       g_lnX0 = rx + dispW(right.substr(0, k));
       g_lnX1 = g_lnX0 + dispW(right.substr(k, right.find("    ", k) - k));
     }
-    if (b.ro && !g_pText && g_msg.empty()) left += " [Read-only]";
+    if (b.ro && !b.pdf && !g_pText && g_msg.empty()) left += " [Read-only]";
   }
   if (g_texPid > 0) left += " ⟳ LaTeX";
   int rw = dispW(right), pcol = 0;
@@ -1342,7 +1460,7 @@ static void draw() {
   o += "\x1b[0m";
   if (g_pText) { at(o, H, std::min(pcol, W)); o += "\x1b[?25h"; }
   else if (crow > 0 && !g_focusSb) { at(o, crow, ccol); o += "\x1b[?25h"; }
-  wr(o);
+  wr(o + "\x1b[?2026l");
 }
 
 
@@ -1360,7 +1478,7 @@ static bool prompt(const char* label, string& s, F cb) {
     unsigned gen = g_msgGen;
     if (k == K_ESC || k == 3 || k == 17) break;
     int ev = -1;
-    if (k == 13) ev = 1;
+    if ((k & ~M_SHIFT) == 13) { ev = 1; g_enterShift = k & M_SHIFT; }
     else if (k == K_UP || k == (K_F3 | M_SHIFT)) ev = 2;
     else if (k == K_DOWN || k == K_F3) ev = 3;
     else if (k == 127 || k == 8) { if (!s.empty()) s.erase(pv(s, len(s))); ev = 0; }
@@ -1422,13 +1540,398 @@ static void doGoto(Buf& b) {
     b.cy = std::max(0, std::min(l - 1, len(b.L) - 1));
     b.cx = c > 0 ? xfromr(b.L[b.cy], c - 1) : firstNonWs(b.L[b.cy]);
     b.sel = false; b.follow = true;
-    int th = H - 2;  // centre the target like VS Code
-    b.top = std::max(0, b.cy - th / 2);
+    int x, y, w, th;  // centre the target like VS Code
+    textRect(cur, x, y, w, th);
+    b.top = b.cy; b.topRow = 0;
+    stepRows(b, wrapW(cur), b.top, b.topRow, -(th / 2));
     return true;
   });
 }
 
-// ───────────────────────── files & tabs ─────────────────────────
+// ───────────────────────── PDF tiles ─────────────────────────
+// A PDF opens in a tile when the terminal has kitty graphics with shared memory (asked once at startup) and
+// vsc-pdf is installed next to vsc or on PATH; otherwise in Okular. vsc-pdf renders pages with Okular's engine into
+// shared memory and vsc hands the names to the terminal, which keeps the images, so scrolling only moves
+// placements (a source rectangle and a pixel offset): pixel-smooth, with Okular's animation - a step is 100 px
+// over 100 ms and a page 200 ms (10x with Shift), eased out quadratically like QScroller, each new step extending
+// the last one's target. vsc is the only writer to the terminal; vsc-pdf only talks to vsc, over a socket.
+static bool g_gfx = false;
+static void closeFile(int armed);
+static pid_t g_pdfPid = -1;
+static string g_pdfBuf, g_pdfExe;
+struct Shm { string name; long long t; };
+static vector<Shm> g_shm;  // names handed to the terminal: it unlinks each once read; we do too, after 2 s
+
+static string findExe(const char* name) {  // next to our own binary, else on PATH
+  char self[PATH_MAX];
+  ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+  if (n > 0) {
+    self[n] = 0;
+    string p = self;
+    p = p.substr(0, p.rfind('/') + 1) + name;
+    if (access(p.c_str(), X_OK) == 0) return p;
+  }
+  const char* e = getenv("PATH");
+  string ps = e ? e : "";
+  for (size_t a = 0, z; a <= ps.size(); a = z + 1) {
+    z = ps.find(':', a);
+    if (z == string::npos) z = ps.size();
+    string p = (z > a ? ps.substr(a, z - a) : string(".")) + "/" + name;
+    if (access(p.c_str(), X_OK) == 0) return p;
+  }
+  return "";
+}
+// Asks the terminal whether it can show a 1x1 image from shared memory. The wait ends at its answer, or at the reply
+// to the DA1 query that follows on terminals without kitty graphics (all of them answer DA1; a late one is ignored).
+static void gfxQuery() {
+  g_pdfExe = findExe("vsc-pdf");
+  if (g_pdfExe.empty()) return;
+  string nm = "/vsc-q." + num(getpid());
+  int fd = shm_open(nm.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) return;
+  bool ok = write(fd, "\0\0\0", 3) == 3;
+  close(fd);
+  if (ok) {
+    string q = "\x1b_Gi=31,a=q,t=s,f=24,s=1,v=1;";
+    b64(q, (const unsigned char*)nm.data(), nm.size());
+    wr(q + "\x1b\\\x1b[c");
+    string r;
+    for (long long end = nowMs() + 1000;;) {
+      pollfd p{0, POLLIN, 0};
+      if (poll(&p, 1, int(std::max(0LL, end - nowMs()))) <= 0) break;
+      char b[256];
+      ssize_t k = read(0, b, sizeof b);
+      if (k <= 0) break;
+      r.append(b, (size_t)k);
+      size_t d = r.find("\x1b[?"), g = r.find("i=31;");
+      if ((g != string::npos && r.find("\x1b\\", g) != string::npos) || (d != string::npos && r.find('c', d) != string::npos)) break;
+    }
+    g_gfx = r.find("i=31;OK") != string::npos;
+  }
+  shm_unlink(nm.c_str());
+}
+static bool pdfStart() {
+  if (g_pdfPid > 0) return true;
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv)) return false;
+  pid_t pid = fork();
+  if (pid == 0) {
+    int dn = open("/dev/null", O_WRONLY);
+    dup2(sv[1], 0); dup2(sv[1], 1);
+    if (dn >= 0) dup2(dn, 2);  // Qt's warnings never reach our screen
+    execl(g_pdfExe.c_str(), "vsc-pdf", (char*)nullptr);
+    _exit(127);
+  }
+  close(sv[1]);
+  if (pid < 0) { close(sv[0]); return false; }
+  g_pdfPid = pid; g_pdfOut = sv[0];
+  return true;
+}
+static void pdfStop() {
+  if (g_pdfPid <= 0) return;
+  close(g_pdfOut); g_pdfOut = -1;
+  kill(g_pdfPid, SIGTERM);
+  while (waitpid(g_pdfPid, nullptr, 0) < 0 && errno == EINTR) {}
+  g_pdfPid = -1;
+  g_pdfBuf.clear();
+}
+static void pdfSend(const string& s) {  // MSG_NOSIGNAL: a dead vsc-pdf is noticed on read, not by SIGPIPE
+  for (size_t n = 0; g_pdfOut >= 0 && n < s.size();) {
+    ssize_t k = send(g_pdfOut, s.data() + n, s.size() - n, MSG_NOSIGNAL);
+    if (k < 0) { if (errno == EINTR) continue; return; }
+    n += (size_t)k;
+  }
+}
+static unsigned imgId(const Buf& b, int page) { return unsigned(b.id) * 100000u + unsigned(page) + 1; }
+static Buf* pdfBuf(int id) {
+  for (auto& b : B)
+    if (b.pdf && b.id == id) return &b;
+  return nullptr;
+}
+// The terminal refused a page (its transmit or a placement): it counts as not sent, so it is neither placed again -
+// every draw would get the same error back, and that reply would ask for another draw - nor kept; the next change of
+// the view asks vsc-pdf for it again.
+static void pdfGfxError(const string& r) {
+  size_t k = r.find("i=");
+  if (k == string::npos) return;
+  unsigned id = unsigned(strtoul(r.c_str() + k + 2, nullptr, 10));
+  Buf* b = id > 100000u ? pdfBuf(int(id / 100000u)) : nullptr;
+  if (!b) return;
+  Pdf& p = *b->pdf;
+  int pg = int(id % 100000u) - 1;
+  if (pg >= 0 && pg < len(p.st) && p.st[pg] == 2) p.st[pg] = 0;
+}
+static void pdfDropImages(Buf& b) {  // frees the terminal's copies of b's pages (and their placements)
+  Pdf& p = *b.pdf;
+  string o;
+  for (int k = 0; k < len(p.st); k++)
+    if (p.st[k] == 2) o += "\x1b_Ga=d,d=I,i=" + num(imgId(b, k)) + ",q=2\x1b\\";
+  p.st.assign(p.st.size(), 0);
+  p.placed.assign(p.placed.size(), 0);
+  p.wantLo = 0; p.wantHi = -1;  // ask again
+  if (!o.empty()) wr(o);
+}
+static void pdfReap(bool all) {  // unlinks the shared memory the terminal has had 2 s to read
+  long long t = nowMs();
+  size_t k = 0;
+  for (size_t i = 0; i < g_shm.size(); i++)
+    if (all || t - g_shm[i].t > 2000) shm_unlink(g_shm[i].name.c_str());
+    else if (k++ != i) g_shm[k - 1] = std::move(g_shm[i]);
+  g_shm.resize(k);
+}
+static void pdfShutdown() {
+  for (auto& b : B)
+    if (b.pdf) pdfDropImages(b);
+  pdfReap(true);
+  if (g_pdfPid > 0) kill(g_pdfPid, SIGTERM);
+}
+static void pdfRelease(Buf& b) {  // b's tile is closing or being replaced
+  if (!b.pdf) return;
+  pdfDropImages(b);
+  pdfSend("c " + num(b.id) + "\n");
+}
+static void pdfIdle() {  // no PDF tile left: vsc-pdf (and its Qt) goes, so it costs nothing while unused
+  for (auto& b : B)
+    if (b.pdf) return;
+  pdfStop();
+}
+static void pdfRead() {
+  char buf[65536];
+  ssize_t n = read(g_pdfOut, buf, sizeof buf);
+  if (n < 0 && errno == EINTR) return;
+  if (n <= 0) {  // vsc-pdf exited
+    pdfStop();
+    for (auto& b : B)
+      if (b.pdf && b.pdf->err.empty()) b.pdf->err = "The PDF renderer (vsc-pdf) stopped - close and reopen " + b.name;
+    return;
+  }
+  g_pdfBuf.append(buf, (size_t)n);
+  string o;
+  size_t s = 0;
+  for (size_t e; (e = g_pdfBuf.find('\n', s)) != string::npos; s = e + 1) {
+    string l = g_pdfBuf.substr(s, e - s);
+    int id = 0, pg = 0, w = 0, h = 0, off = 0;
+    char nm[256];
+    if (l[0] == 'p' && sscanf(l.c_str(), "p %d %d %d %d %255s", &id, &pg, &w, &h, nm) == 5) {
+      Buf* b = pdfBuf(id);
+      Pdf* p = b ? b->pdf.get() : nullptr;
+      if (p && p->w == w && pg >= 0 && pg < len(p->st) && p->st[pg] == 1 && p->hs[pg] == h) {
+        o += "\x1b_Ga=t,t=s,f=24,s=" + num(w) + ",v=" + num(h) + ",i=" + num(imgId(*b, pg)) + ",q=1;";  // q=1: errors only
+        b64(o, (const unsigned char*)nm, strlen(nm));
+        o += "\x1b\\";
+        p->st[pg] = 2;
+        g_shm.push_back({nm, nowMs()});
+      } else shm_unlink(nm);  // for a layout that is gone
+    } else if (l[0] == 'n' && sscanf(l.c_str(), "n %d %d%n", &id, &pg, &off) == 2 && off) {
+      Buf* b = pdfBuf(id);
+      if (!b) continue;
+      Pdf& p = *b->pdf;
+      p.pw.assign((size_t)std::max(0, pg), 0);
+      p.ph.assign(p.pw.size(), 0);
+      char* q = &l[off];
+      for (int k = 0; k < pg; k++) { p.pw[k] = strtof(q, &q); p.ph[k] = strtof(q, &q); }
+      p.w = 0;  // lay out afresh (a reload keeps the scroll position: see pdfLayout)
+      p.err.clear();
+    } else if (l[0] == 'e' && sscanf(l.c_str(), "e %d %n", &id, &off) == 1 && off) {
+      if (Buf* b = pdfBuf(id)) b->pdf->err = b->name + " " + l.substr(off);
+    }
+  }
+  g_pdfBuf.erase(0, s);
+  if (!o.empty()) wr(o);
+}
+static bool pdfOpen(Buf& nb) {  // nb: a new tile for the PDF at nb.path
+  getSize();
+  if (!g_gfx || !g_pxW || !g_pxH || !pdfStart()) return false;  // no pixel sizes: the pages could not be placed
+  nb.pdf.reset(new Pdf);
+  nb.ro = true;
+  nb.langName = "PDF";
+  pdfSend("o " + num(nb.id) + " " + nb.path + "\n");
+  return true;
+}
+static void pdfReload(const string& path) {  // a rebuilt PDF (LaTeX): shown again at the same place
+  for (auto& b : B)
+    if (b.pdf && b.path == path) { pdfDropImages(b); pdfSend("o " + num(b.id) + " " + path + "\n"); }
+}
+// Lays the pages out for a view vw pixels wide (a no-op unless the width or document changed), keeping the point at
+// the view's centre where it was.
+static void pdfLayout(Buf& b, int vw) {
+  Pdf& p = *b.pdf;
+  int w = std::max(16, std::min(4000, int((vw - 6) * p.zoom + 0.5))), n = len(p.pw);
+  if (w == p.w || !n) return;
+  double fy = p.total ? (p.ty + p.vh / 2.0) / p.total : 0, fx = p.w ? (p.tx + std::min(vw, p.w + 6) / 2.0) / (p.w + 6.0) : 0;
+  pdfDropImages(b);
+  p.tops.resize((size_t)n); p.hs.resize((size_t)n);
+  int y = 0;
+  for (int k = 0; k < n; k++) {
+    p.hs[k] = std::max(1, int(p.pw[k] > 0 ? w * (double)p.ph[k] / p.pw[k] + 0.5 : w * 1.4142));
+    p.tops[k] = y + 6;
+    y += p.hs[k] + 12;
+  }
+  p.total = y;
+  p.w = w;
+  p.st.assign((size_t)n, 0);
+  p.placed.assign((size_t)n, 0);
+  p.ty = p.fy = fy * p.total - p.vh / 2.0;
+  p.tx = p.fx = p.w + 6 > vw ? fx * (p.w + 6) - vw / 2.0 : 0;
+  p.anim = false;
+}
+static void pdfPos(Pdf& p, double& y, double& x) {  // the animated scroll position now
+  double t = p.anim && p.dur > 0 ? double(nowMs() - p.t0) / p.dur : 1;
+  if (t >= 1) { p.anim = false; y = p.ty; x = p.tx; return; }
+  double e = 1 - (1 - t) * (1 - t);  // OutQuad, QScroller's default scrolling curve
+  y = p.fy + (p.ty - p.fy) * e;
+  x = p.fx + (p.tx - p.fx) * e;
+}
+static double clampD(double v, double lo, double hi) { return std::max(lo, std::min(v, hi)); }
+static void pdfScroll(Pdf& p, double y, double x, int dur, bool rel = true) {
+  double cy, cx;
+  pdfPos(p, cy, cx);
+  if (rel) { y += p.ty; x += p.tx; }  // from where the last scroll is heading, like Okular's finalPosition()
+  p.fy = cy; p.fx = cx;
+  p.ty = clampD(y, 0, p.maxY); p.tx = clampD(x, 0, p.maxX);
+  p.t0 = nowMs(); p.dur = dur;
+  p.anim = dur > 0 && (p.ty != cy || p.tx != cx);
+}
+static int pdfFrameMs() {  // poll timeout: a frame's time while a PDF is scrolling, else forever
+  for (auto& b : B)
+    if (b.pdf && b.pdf->anim) return 8;
+  return -1;
+}
+static int pdfPage(const Pdf& p) {  // the page at the view's centre
+  if (p.tops.empty()) return 0;
+  int y = int(p.ty + p.vh / 2);
+  return std::max(0, int(std::upper_bound(p.tops.begin(), p.tops.end(), y) - p.tops.begin()) - 1);
+}
+// Places tile i's visible pages (and asks for the ones about to be, and frees the far ones).
+static void pdfPlace(string& o, int i) {
+  Buf& b = B[i];
+  Pdf& p = *b.pdf;
+  int X, Y, TW, TH, n = len(p.pw);
+  textRect(i, X, Y, TW, TH);
+  int cw = W ? g_pxW / W : 0, ch = H ? g_pxH / H : 0, vw = TW * cw, vh = TH * ch;
+  static vector<char> now;
+  now.assign((size_t)n, 0);
+  int a = 0, z = -1;
+  if (n && vw > 16 && vh > 0) {
+    pdfLayout(b, vw);
+    p.vh = vh;
+    p.maxY = std::max(0, p.total - vh);
+    p.maxX = std::max(0, p.w + 6 - vw);
+    p.ty = clampD(p.ty, 0, p.maxY); p.tx = clampD(p.tx, 0, p.maxX);
+    p.fy = clampD(p.fy, 0, p.maxY); p.fx = clampD(p.fx, 0, p.maxX);
+    double fy, fx;
+    pdfPos(p, fy, fx);
+    int y = int(fy + 0.5), left = p.w + 6 <= vw ? (vw - p.w) / 2 : 3 - int(fx + 0.5);
+    a = std::max(0, int(std::upper_bound(p.tops.begin(), p.tops.end(), y) - p.tops.begin()) - 1);
+    for (z = a; z + 1 < n && p.tops[z + 1] < y + vh; z++) {}
+    for (int k = a; k <= z; k++) {
+      int top = p.tops[k] - y, sx = std::max(0, -left), sy = std::max(0, -top), dx = std::max(0, left), dy = std::max(0, top);
+      int w = std::min(p.w - sx, vw - dx), h = std::min(p.hs[k] - sy, vh - dy);
+      if (w <= 0 || h <= 0 || p.st[k] != 2) continue;
+      at(o, Y + dy / ch + 1, X + dx / cw + 1);
+      o += "\x1b_Ga=p,i=" + num(imgId(b, k)) + ",p=1,x=" + num(sx) + ",y=" + num(sy) + ",w=" + num(w) + ",h=" + num(h) +
+           ",X=" + num(dx % cw) + ",Y=" + num(dy % ch) + ",C=1,q=1\x1b\\";
+      now[k] = 1;
+    }
+    // Ask for what will be on screen when the scroll stops, and one page either side - not the pages a long jump
+    // sweeps past - and only when that changes; vsc-pdf drops whatever else is still queued.
+    int ty = int(p.ty + 0.5), ta = std::max(0, int(std::upper_bound(p.tops.begin(), p.tops.end(), ty) - p.tops.begin()) - 1), tz;
+    for (tz = ta; tz + 1 < n && p.tops[tz + 1] < ty + vh; tz++) {}
+    int lo = std::max(0, ta - 1), hi = std::min(n - 1, tz + 1);
+    if (lo != p.wantLo || hi != p.wantHi) {
+      string r = "w " + num(b.id);
+      for (int k = lo; k <= hi; k++)
+        if (p.st[k] != 2) { r += " " + num(k) + " " + num(p.w) + " " + num(p.hs[k]); p.st[k] = 1; }
+      for (int k = std::max(0, p.wantLo); k <= std::min(n - 1, p.wantHi); k++)
+        if (p.st[k] == 1 && (k < lo || k > hi)) p.st[k] = 0;  // dropped by vsc-pdf: a late reply is unlinked
+      pdfSend(r + "\n");
+      p.wantLo = lo; p.wantHi = hi;
+    }
+    a = std::min(a, ta); z = std::max(z, tz);  // for eviction below: keep what is near either
+  }
+  for (int k = 0; k < n && k < len(p.placed); k++) {
+    if (p.placed[k] && !now[k]) o += "\x1b_Ga=d,d=i,i=" + num(imgId(b, k)) + ",p=1,q=2\x1b\\";
+    p.placed[k] = now[k];
+    if (p.st[k] == 2 && (k < a - 3 || k > z + 3)) { o += "\x1b_Ga=d,d=I,i=" + num(imgId(b, k)) + ",q=2\x1b\\"; p.st[k] = 0; }
+  }
+}
+static void pdfTile(string& o, int i) {  // the full redraw of a PDF tile: background, a message if any, the pages
+  Buf& b = B[i];
+  Pdf& p = *b.pdf;
+  int X, Y, TW, TH;
+  textRect(i, X, Y, TW, TH);
+  col(o, FGN, BG);
+  for (int r = 0; r < TH; r++) { at(o, Y + r + 1, X + 1); o.append((size_t)std::max(0, TW), ' '); }
+  string m = !p.err.empty() ? p.err : p.pw.empty() ? "Opening " + b.name + "..." : !g_pxW ? "The terminal does not report its size in pixels" : "";
+  if (!m.empty() && TH > 0) {
+    m = fitW(m, TW);
+    at(o, Y + TH / 2 + 1, X + (TW - dispW(m)) / 2 + 1);
+    col(o, GUT, BG);
+    o += m;
+  }
+  pdfPlace(o, i);
+}
+static void pdfFrame() {  // an animation frame: only the placements move, in one synchronized update
+  pdfReap(false);
+  string o = "\x1b[?2026h\x1b" "7";
+  for (int i = 0; i < len(B); i++)
+    if (B[i].pdf) pdfPlace(o, i);
+  wr(o + "\x1b" "8\x1b[?2026l");
+}
+static void pdfGoto(Buf& b) {
+  Pdf& p = *b.pdf;
+  if (p.tops.empty()) return;
+  string s;
+  prompt(("Go to page (1-" + num(len(p.tops)) + "): ").c_str(), s, [&](int ev) {
+    if (ev != 1) return false;
+    int n = atoi(s.c_str());
+    if (n < 0) n += len(p.tops) + 1;
+    n = std::max(1, std::min(n, len(p.tops)));
+    pdfScroll(p, p.tops[n - 1] - 6, p.tx, 200, false);
+    return true;
+  });
+}
+static const double ZOOMS[] = {0.25, 0.33, 0.5, 0.66, 0.75, 1, 1.25, 1.5, 2, 3, 4};  // times fit width
+static void pdfKey(Buf& b, int k) {
+  Pdf& p = *b.pdf;
+  int base = k & ~M_ALL, step = (k & M_SHIFT) ? 10 : 1;
+  switch (base) {
+    case 'J': step = 10; /* fall through */
+    case K_DOWN: case 'j': pdfScroll(p, 100 * step, 0, 100); break;
+    case 'K': step = 10; /* fall through */
+    case K_UP: case 'k': pdfScroll(p, -100 * step, 0, 100); break;
+    case K_PGDN: case ' ': pdfScroll(p, p.vh, 0, 200); break;
+    case K_PGUP: case 127: case 8: pdfScroll(p, -p.vh, 0, 200); break;
+    case K_RIGHT: case 'l': pdfScroll(p, 0, 20 * step, 100); break;
+    case K_LEFT: case 'h': pdfScroll(p, 0, -20 * step, 100); break;
+    case K_HOME: pdfScroll(p, 0, p.tx, 200, false); break;
+    case K_END: pdfScroll(p, p.maxY, p.tx, 200, false); break;
+    case 7: pdfGoto(b); break;  // Ctrl+G
+    case '0': p.zoom = 1; break;
+    case '+': case '=': for (double z : ZOOMS) if (z > p.zoom + 1e-6) { p.zoom = z; break; } break;
+    case '-': for (int i = int(sizeof ZOOMS / sizeof *ZOOMS) - 1; i >= 0; i--) if (ZOOMS[i] < p.zoom - 1e-6) { p.zoom = ZOOMS[i]; break; } break;
+  }
+}
+static bool pdfMouse(int ti, int armed) {  // true: handled (the pointer is over PDF tile ti)
+  Buf& b = B[ti];
+  if (!b.pdf) return false;
+  Pdf& p = *b.pdf;
+  if (mB & 64) {  // wheel: a notch is an arrow key's step, like Okular's; buttons 6/7 are sideways
+    int d = mB & 3, step = (mB & 4) ? 10 : 1;
+    if (d < 2) pdfScroll(p, (d ? 100 : -100) * step, 0, 100);
+    else pdfScroll(p, 0, (d == 3 ? 20 : -20) * step, 100);
+    return true;
+  }
+  if (!mDown || (mB & 3) != 0 || (mB & 32)) return true;
+  g_focusSb = false;
+  cur = ti;
+  int X, Y, TW, TH;
+  tileRect(ti, X, Y, TW, TH);
+  if (len(B) > 1 && TW >= 4 && TH >= 3 && mY == Y && mX == X + TW - 1) closeFile(armed);  // ×
+  return true;
+}
+
+// ───────────────────────── files ─────────────────────────
 // Opens a PDF in Okular, detached: its own session (so it outlives vsc and a closed terminal) and no
 // stdio (so its warnings never land on our screen). Double fork, so there is no child left to reap.
 static void openOkular(const string& path) {
@@ -1464,10 +1967,18 @@ static void openOkular(const string& path) {
   if (n == (ssize_t)sizeof e) msg(e == ENOENT ? "okular not found - install it to open PDFs" : "Cannot launch Okular: " + string(strerror(e)));
   else msg("Opened " + baseName(path) + " in Okular");
 }
-// Opens path in a tab (true), or a PDF in Okular (false: no tab).
-static bool openFile(const string& path) {
-  for (size_t i = 0; i < B.size(); i++)
-    if (B[i].path == path) { cur = (int)i; return true; }
+// Asks before the focused tile's unsaved changes are thrown away (true: go ahead).
+static bool discardOk() {
+  if (B.empty() || !B[cur].dirty()) return true;
+  string a;
+  return prompt(("Discard changes to " + B[cur].name + "? (y/N): ").c_str(), a, [](int ev) { return ev == 1; }) && (a == "y" || a == "Y");
+}
+// Opens path in a new tile (tile) or in place of the focused tile's file, focusing it (true). A PDF gets a PDF tile
+// where the terminal can show one, and goes to Okular otherwise (false: the tiles are untouched). A file that is
+// already open just has its tile focused.
+static bool openFile(const string& path, bool tile) {
+  for (int i = 0; i < len(B); i++)
+    if (B[i].path == path) { cur = i; return true; }
   struct stat stt;
   if (stat(path.c_str(), &stt) == 0 && S_ISDIR(stt.st_mode)) { msg(path + " is a directory"); return false; }
   Buf nb;
@@ -1479,12 +1990,12 @@ static bool openFile(const string& path) {
   int openErr = errno;
   char magic[5] = {0};
   bool pdfMagic = f && fread(magic, 1, 4, f) == 4 && !memcmp(magic, "%PDF", 4);
-  if (pdfMagic || extOf(nb.name) == "pdf") {  // Okular's, never a text tab
+  if (pdfMagic || extOf(nb.name) == "pdf") {  // a PDF tile's or Okular's, never the editor's
     if (f) fclose(f);
-    if (!f) msg(openErr == ENOENT ? nb.name + " does not exist" : "Cannot open " + path + ": " + strerror(openErr));
-    else if (!pdfMagic && stt.st_size == 0) msg(nb.name + " is empty");
-    else openOkular(path);
-    return false;
+    if (!f) return msg(openErr == ENOENT ? nb.name + " does not exist" : "Cannot open " + path + ": " + strerror(openErr));
+    if (!pdfMagic && stt.st_size == 0) return msg(nb.name + " is empty");
+    if (!pdfOpen(nb)) { openOkular(path); return false; }
+    f = nullptr;
   }
   if (f) {
     // Read twice in 64 KB chunks - once to count the lines, once to fill them - so the only copy of the
@@ -1533,14 +2044,16 @@ static bool openFile(const string& path) {
     if (nb.crlf)
       for (auto& l : nb.L)
         if (!l.empty() && l.back() == '\r') l.pop_back();
-  } else if (openErr != ENOENT) {
+  } else if (!nb.pdf && openErr != ENOENT) {
     msg("Cannot open " + path + ": " + strerror(openErr));
     return false;
   }
-  // replace a lone, untouched Untitled tab
-  if (B.size() == 1 && B[0].path.empty() && !B[0].dirty() && B[0].L.size() == 1 && B[0].L[0].empty()) B.clear();
-  B.push_back(std::move(nb));
-  cur = (int)B.size() - 1;
+  if (tile || B.empty()) { B.push_back(std::move(nb)); cur = len(B) - 1; return true; }
+  if (!discardOk()) { pdfRelease(nb); pdfIdle(); return false; }
+  pdfRelease(B[cur]);
+  B[cur] = std::move(nb);
+  pdfIdle();
+  malloc_trim(0);  // hand the replaced buffer's pages back to the OS
   return true;
 }
 static bool save(Buf& b) {
@@ -1551,7 +2064,7 @@ static bool save(Buf& b) {
     if (!prompt("Save as: ", p, [](int ev) { return ev == 1; }) || p.empty()) return false;
     path = absPath(expandHome(p));
     for (auto& o : B)
-      if (&o != &b && o.path == path) return msg("\"" + o.name + "\" is open in another tab - close it first");
+      if (&o != &b && o.path == path) return msg("\"" + o.name + "\" is open in another tile - close it first");
     struct stat st;
     if (stat(path.c_str(), &st) == 0) {
       if (S_ISDIR(st.st_mode)) return msg(path + " is a folder");
@@ -1577,16 +2090,18 @@ static bool save(Buf& b) {
   if (extOf(b.name) == "tex") texBuild(b);
   return true;
 }
-static void closeTab(int i, int armed) {
-  if (B[i].dirty() && armed != 2 + i) {
-    g_armed = 2 + i; cur = i;
-    msg("\"" + B[i].name + "\" has unsaved changes - Ctrl+W (or click ×) again to discard, Ctrl+S to save");
+static void closeFile(int armed) {
+  if (B[cur].dirty() && armed != 2 + B[cur].id) {  // armed for this tile's file, not any other
+    g_armed = 2 + B[cur].id;
+    msg("\"" + B[cur].name + "\" has unsaved changes - Ctrl+W (or click ×) again to discard, Ctrl+S to save");
     return;
   }
-  B.erase(B.begin() + i);
+  pdfRelease(B[cur]);
+  B.erase(B.begin() + cur);
+  pdfIdle();
   malloc_trim(0);  // hand the closed buffer's pages back to the OS
-  if (B.empty()) { cur = 0; g_focusSb = true; return; }
-  if (cur > i || cur >= (int)B.size()) cur = std::max(0, cur - 1);
+  if (B.empty()) { cur = 0; g_focusSb = true; }
+  else cur = std::min(cur, len(B) - 1);
 }
 
 // ───────────────────────── editing commands ─────────────────────────
@@ -1839,7 +2354,7 @@ static void sbCreate(bool dir) {
   g_sbSelPath = p;
   buildRows();
   sbShow(selIndex());
-  if (!dir && openFile(p)) g_focusSb = false;
+  if (!dir && openFile(p, false)) g_focusSb = false;
 }
 static void sbRename() {
   buildRows();
@@ -1919,9 +2434,9 @@ static void sbKey(int k) {
       if (r.n->dir && r.n->open) r.n->open = false;
       else if (r.parent >= 0) sel(r.parent);
       return;
-    case 13: case ' ':
+    case 13: case 13 | M_SHIFT: case ' ':  // Shift+Enter / Ctrl+Enter: open in a new tile
       if (r.n->dir) toggleNode(*r.n, r.path);
-      else if (openFile(r.path) && k == 13) g_focusSb = false;
+      else if (openFile(r.path, k == (13 | M_SHIFT)) && k != ' ') g_focusSb = false;
       return;
   }
   if (k > 32 && k < 127)  // type to jump
@@ -1957,7 +2472,7 @@ static void sbMouse() {
   Row r = g_rows[j];
   g_sbSelPath = r.path;
   if (r.n->dir) toggleNode(*r.n, r.path);
-  else if (openFile(r.path)) g_focusSb = false;
+  else if (openFile(r.path, mB & 28)) g_focusSb = false;  // Alt/Ctrl/Shift+click: open in a new tile
 }
 
 static void mouse(int armed) {
@@ -1971,40 +2486,42 @@ static void mouse(int armed) {
   if (mDown && !motion && !(mB & 64) && g_sbW && mX == g_sbW - 1 && mY > 0 && mY < H - 1) { g_sbResizing = true; return; }
   if (g_sbW && mX < g_sbW && mY < H - 1 && !(g_drag && motion)) { sbMouse(); return; }
   if (B.empty()) return;
-  Buf& b = B[cur];
+  int ti = cur;  // the tile under the pointer (a drag stays in the tile it started in)
+  if (!(g_drag && motion) && mY < H - 1)
+    for (int i = 0; i < len(B); i++) {
+      int x, y, w, h;
+      tileRect(i, x, y, w, h);
+      if (mX >= x && mX < x + w && mY >= y && mY < y + h) ti = i;
+    }
+  if (mY < H - 1 && pdfMouse(ti, armed)) return;
+  Buf& b = B[ti];
   int n = len(b.L);
   if (mB & 64) {  // wheel
-    int d = (mB & 1) ? 1 : -1;
-    if (mY == 0) { cur = (cur + d + (int)B.size()) % (int)B.size(); return; }
-    b.top = std::max(0, std::min(n - 1, b.top + 3 * d));
+    stepRows(b, wrapW(ti), b.top, b.topRow, (mB & 1) ? 3 : -3);
     b.follow = false;
     return;
   }
   int btn = mB & 3;
   if (!mDown) { g_drag = false; return; }
-  if (!motion && mY == 0) {
-    for (size_t i = 0; i < g_tabs.size() && i < B.size(); i++)
-      if (g_tabs[i].x0 >= 0 && mX >= g_tabs[i].x0 && mX < g_tabs[i].x1) {
-        if (btn == 1 || (btn == 0 && std::abs(mX - g_tabs[i].cx) <= 1)) closeTab((int)i, armed);
-        else if (btn == 0) { cur = (int)i; g_focusSb = false; }
-        return;
-      }
-    if (btn == 0 && nowMs() - g_lastClick < 400) newTab();
-    g_lastClick = nowMs();
-    return;
-  }
   if (!motion && mY == H - 1) {
     if (btn != 0) return;
-    if (mX >= g_lnX0 && mX < g_lnX1) doGoto(b);
+    if (mX >= g_lnX0 && mX < g_lnX1) { if (b.pdf) pdfGoto(b); else doGoto(b); }
     return;
   }
-  if (!motion && mY == 1) { g_focusSb = false; return; }  // breadcrumbs
   if (btn != 0) return;
   g_focusSb = false;
-  int y = std::max(0, std::min(n - 1, b.top + mY - 2));
-  int gw = gutterW(b);
-  bool gutter = mX - EX < gw;
-  int x = gutter ? 0 : xfromr(b.L[y], mX - EX - gw + b.left);
+  cur = ti;
+  int X, Y, TW, TH;
+  tileRect(ti, X, Y, TW, TH);
+  if (!motion && len(B) > 1 && TW >= 4 && TH >= 3 && mY == Y && mX == X + TW - 1) { closeFile(armed); return; }  // ×
+  textRect(ti, X, Y, TW, TH);
+  if (!motion && (mX < X || mX >= X + TW || mY < Y || mY >= Y + TH)) return;  // on the border: just focus
+  int y = b.top, k = b.topRow, gw = gutterW(b);
+  stepRows(b, std::max(1, TW - gw), y, k, mY - Y);
+  bool gutter = mX - X < gw;
+  static vector<int> st;
+  wrapRows(b.L[y], std::max(1, TW - gw), st);
+  int x = gutter ? 0 : rowX(b.L[y], st, k, mX - X - gw);
   b.follow = true; b.want = -1;
   if (motion) {
     if (!g_drag) return;
@@ -2045,7 +2562,7 @@ static void editKey(Buf& b, int k) {
   }
   if (base >= K_UP && base <= K_PGDN) {
     if (ct && (base == K_UP || base == K_DOWN)) {
-      b.top = std::max(0, std::min(n - 1, b.top + (base == K_UP ? -1 : 1)));
+      stepRows(b, wrapW(cur), b.top, b.topRow, base == K_UP ? -1 : 1);
       b.follow = false;
       return;
     }
@@ -2077,16 +2594,24 @@ static void editKey(Buf& b, int k) {
         if (ct) b.cy = n - 1;
         b.cx = len(b.L[b.cy]);
         break;
-      default: {
-        if (b.want < 0) b.want = rcol(l, b.cx);
-        int page = H - 3;
-        int d = base == K_UP ? -1 : base == K_DOWN ? 1 : base == K_PGUP ? -page : page;
-        int ny = b.cy + d;
-        if (ny < 0) { b.cy = 0; b.cx = 0; break; }
-        if (ny >= n) { b.cy = n - 1; b.cx = len(b.L[n - 1]); break; }
-        if (base == K_PGUP || base == K_PGDN) b.top = std::max(0, b.top + d);
+      default: {  // by wrapped rows, keeping the column within the row
+        int X, Y, TW, page, ww = wrapW(cur);
+        textRect(cur, X, Y, TW, page);
+        page = std::max(1, page);
+        static vector<int> st;
+        wrapRows(l, ww, st);
+        int k = rowOf(st, b.cx);
+        if (b.want < 0) b.want = rcol(l, b.cx) - rcol(l, st[k]);
+        int d = base == K_UP ? -1 : base == K_DOWN ? 1 : base == K_PGUP ? -page : page, ny = b.cy, nk = k;
+        stepRows(b, ww, ny, nk, d);
+        if (ny == b.cy && nk == k) {  // already on the first / last row
+          if (d < 0) b.cx = 0; else b.cx = len(l);
+          break;
+        }
+        if (base == K_PGUP || base == K_PGDN) stepRows(b, ww, b.top, b.topRow, d);
         b.cy = ny;
-        b.cx = xfromr(b.L[ny], b.want);
+        wrapRows(b.L[ny], ww, st);
+        b.cx = rowX(b.L[ny], st, nk, b.want);
       }
     }
     return;
@@ -2155,32 +2680,33 @@ static void handle(int k) {
       return;
     case 14:  // Ctrl+N
       if (g_focusSb) sbCreate(false);
-      else newTab();
+      else newFile();
       return;
     case 15: {  // Ctrl+O
       string p;
       if (prompt("Open file: ", p, [](int ev) { return ev == 1; }) && !p.empty()) {
         string a = absPath(expandHome(p));
         if (isDirPath(a)) { g_rootPath = a; g_root = Node(); g_root.name = baseName(a); g_root.open = true; refresh(); g_focusSb = true; }
-        else if (openFile(a)) g_focusSb = false;
+        else if (openFile(a, g_enterShift)) g_focusSb = false;
       }
       return;
     }
   }
   if (has) switch (k) {
     case 19: save(B[cur]); return;              // Ctrl+S
-    case 23: closeTab(cur, armed); return;      // Ctrl+W
-    case K_PGUP | M_CTRL: cur = (cur + (int)B.size() - 1) % (int)B.size(); return;
-    case K_PGDN | M_CTRL: cur = (cur + 1) % (int)B.size(); return;
+    case 23: closeFile(armed); return;          // Ctrl+W
+    case K_PGUP | M_CTRL: cur = (cur + len(B) - 1) % len(B); g_focusSb = false; return;  // focus the previous tile
+    case K_PGDN | M_CTRL: cur = (cur + 1) % len(B); g_focusSb = false; return;
   }
-  if (k >= (M_ALT | '1') && k <= (M_ALT | '9')) {
+  if (k >= (M_ALT | '1') && k <= (M_ALT | '9')) {  // Alt+N: focus tile N
     int i = (k & 0xff) - '1';
-    if (i < (int)B.size()) { cur = i; g_focusSb = false; }
+    if (i < len(B)) { cur = i; g_focusSb = false; }
     return;
   }
   if (g_focusSb || !has) { if (g_sbShow) { g_focusSb = true; sbKey(k); } return; }
   Buf& b = B[cur];
-  editKey(b, k);
+  if (b.pdf) pdfKey(b, k);
+  else editKey(b, k == (13 | M_SHIFT) ? 13 : k);
 }
 
 int main(int argc, char** argv) {
@@ -2191,8 +2717,10 @@ int main(int argc, char** argv) {
       puts("usage: vsc [folder] [file ...]     (default folder: current directory)\n"
            "  Ctrl+E explorer  Ctrl+B sidebar  Ctrl+O open  Ctrl+N new  Ctrl+S save  Ctrl+W close  Ctrl+Q quit\n"
            "  Ctrl+F find  Ctrl+G go to line  Ctrl+Z/Y undo/redo  Ctrl+/ comment  Alt+Up/Down move line\n"
-           "  Explorer: Enter open, F2 rename, Del trash, Ctrl+N new file, Alt+N new folder\n"
-           "  PDFs open in Okular");
+           "  Explorer: Enter open, Shift+Enter/Alt+click open in a new tile, F2 rename, Del trash, Ctrl+N new file, Alt+N new folder\n"
+           "  Ctrl+PgUp/PgDn or Alt+1-9 focus tile\n"
+           "  PDFs open in a tile in terminals with kitty graphics (Ghostty, kitty; needs vsc-pdf), else in Okular:\n"
+           "    Up/Down/j/k scroll, PgUp/PgDn/Space page, Home/End, +/-/0 zoom, Ctrl+G go to page");
       return 0;
     }
     if (isDirPath(argv[i])) { if (root.empty()) root = argv[i]; }
@@ -2204,13 +2732,18 @@ int main(int argc, char** argv) {
   g_root.open = true;
   refresh();
   rawOn();
+  gfxQuery();
   wr("\x1b[22;0t");  // save the terminal title
   getSize();
-  for (auto& f : files) openFile(absPath(f));
+  for (auto& f : files) openFile(absPath(f), true);  // one tile each
   cur = 0;
   g_focusSb = B.empty();
   while (g_run) {
-    if (ibP >= ibN) draw();
+    if (ibP >= ibN) {
+      if (g_tick) pdfFrame();  // a scroll animation frame: only the PDF placements move
+      else draw();
+    }
+    g_tick = false;
     int k = readKey();
     if (k == K_NONE) continue;
     unsigned gen = g_msgGen;
@@ -2219,14 +2752,14 @@ int main(int argc, char** argv) {
     ++g_grp;
     if (k != K_MOUSE && !B.empty()) B[cur].follow = true;
     handle(k);
+    g_tick = false;  // a prompt's reads may have set it: what follows needs a full draw
     if (!g_run) break;
     if (!B.empty()) {
-      cur = std::min(cur, (int)B.size() - 1);
       Buf& b = B[cur];
       clampCur(b);
       if (!b.U.empty() && b.U.back().g == g_grp) { b.U.back().ey = b.cy; b.U.back().ex = b.cx; }
     }
-    if (g_msgGen == gen) g_msg.clear();
+    if (g_msgGen == gen && !(k == K_MOUSE && (!mDown || (mB & 32)))) g_msg.clear();  // a release or drag keeps it
   }
   return 0;
 }

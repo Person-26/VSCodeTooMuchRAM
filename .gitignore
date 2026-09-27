@@ -1,2 +1,4 @@
 vsc
 *.o
+vsc-pdf
+build-pdf/
