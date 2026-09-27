@@ -12,14 +12,10 @@ vsc: vsc.cpp
 static: vsc.cpp
 	$(CXX) $(CXXFLAGS) -static -o vsc $< $(LDFLAGS)
 
-# test tool: drives vsc in a pseudo-terminal and decodes its sixel output (see sixtest.cpp)
-sixtest: sixtest.cpp
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ $< -lutil
-
 install: vsc
 	install -Dm755 vsc $(PREFIX)/bin/vsc
 
 clean:
-	rm -f vsc sixtest
+	rm -f vsc
 
 .PHONY: static install clean
